@@ -1,3 +1,4 @@
+
 name: MysteryVerse Automation
 
 on:
@@ -20,8 +21,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run MysteryVerse
+      - name: Test MysteryVerse
         run: |
           echo "MysteryVerse automation started!"
-          echo "Daily workflow is working."
-          
+          echo "Daily workflow is working!"
