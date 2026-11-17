@@ -3,6 +3,7 @@ import json
 import asyncio
 import subprocess
 import random
+import time
 import requests
 import edge_tts
 
@@ -15,6 +16,7 @@ from googleapiclient.http import MediaFileUpload
 VIDEO = "mysteryverse_short.mp4"
 POSTER = "poster.png"
 AUDIO = "narration.mp3"
+
 
 def generate_story():
     key = os.environ["GEMINI_API_KEY"]
@@ -34,22 +36,68 @@ Keep title under 80 characters.
         "models/gemini-3.8-flash:generateContent"
     )
 
-    response = requests.post(
-        url,
-        params={"key": key},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
-        },
-        timeout=120
-    )
-    response.raise_for_status()
+    # Retry Gemini requests if the server is slow or temporarily unavailable.
+    for attempt in range(4):
+        try:
+            print(f"Generating story with Gemini (attempt {attempt + 1}/4)...")
 
-    result = response.json()
-    text = result["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+            response = requests.post(
+                url,
+                params={"key": key},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "responseMimeType": "application/json"
+                    }
+                },
+                timeout=(20, 300)
+            )
+
+            # Retry temporary server errors and rate limits.
+            if response.status_code in (429, 500, 502, 503, 504):
+                if attempt < 3:
+                    wait = 15 * (attempt + 1)
+                    print(
+                        f"Gemini temporarily unavailable "
+                        f"({response.status_code}). Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+
+            response.raise_for_status()
+
+            result = response.json()
+
+            if "candidates" not in result or not result["candidates"]:
+                raise RuntimeError(
+                    f"Gemini returned no candidates: {result}"
+                )
+
+            text = result["candidates"][0]["content"]["parts"][0]["text"]
+            story = json.loads(text)
+
+            for field in ("title", "narration", "description"):
+                if not story.get(field):
+                    raise ValueError(f"Gemini response missing: {field}")
+
+            print("Story generated successfully.")
+            return story
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as error:
+            if attempt == 3:
+                raise
+
+            wait = 15 * (attempt + 1)
+            print(
+                f"Gemini connection problem: {error.__class__.__name__}. "
+                f"Retrying in {wait}s..."
+            )
+            time.sleep(wait)
+
+    raise RuntimeError("Gemini could not generate a story after 4 attempts.")
 
 
 def make_poster(title, narration):
@@ -68,7 +116,10 @@ def make_poster(title, narration):
     for _ in range(100):
         x = random.randint(0, width)
         y = random.randint(0, height)
-        draw.ellipse((x, y, x + 4, y + 4), fill=(150, 170, 210))
+        draw.ellipse(
+            (x, y, x + 4, y + 4),
+            fill=(150, 170, 210)
+        )
 
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     regular_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -80,14 +131,25 @@ def make_poster(title, narration):
     except OSError:
         big = medium = small = ImageFont.load_default()
 
-    draw.text((65, 100), "MYSTERYVERSE", font=small, fill="white")
-    draw.text((65, 250), "TONIGHT'S", font=small, fill=(120, 190, 255))
+    draw.text(
+        (65, 100),
+        "MYSTERYVERSE",
+        font=small,
+        fill="white"
+    )
+    draw.text(
+        (65, 250),
+        "TONIGHT'S",
+        font=small,
+        fill=(120, 190, 255)
+    )
 
     words = title.split()
     lines, line = [], ""
 
     for word in words:
         test = (line + " " + word).strip()
+
         if draw.textbbox((0, 0), test, font=big)[2] > 930:
             lines.append(line)
             line = word
@@ -98,8 +160,14 @@ def make_poster(title, narration):
         lines.append(line)
 
     y = 350
+
     for line in lines[:4]:
-        draw.text((65, y), line, font=big, fill="white")
+        draw.text(
+            (65, y),
+            line,
+            font=big,
+            fill="white"
+        )
         y += 105
 
     draw.rounded_rectangle(
@@ -114,6 +182,7 @@ def make_poster(title, narration):
 
     for word in words:
         test = (line + " " + word).strip()
+
         if draw.textbbox((0, 0), test, font=medium)[2] > 870:
             lines.append(line)
             line = word
@@ -124,8 +193,14 @@ def make_poster(title, narration):
         lines.append(line)
 
     y = 970
+
     for line in lines[:8]:
-        draw.text((100, y), line, font=medium, fill="white")
+        draw.text(
+            (100, y),
+            line,
+            font=medium,
+            fill="white"
+        )
         y += 65
 
     draw.text(
@@ -136,6 +211,7 @@ def make_poster(title, narration):
     )
 
     img.save(POSTER)
+    print("Poster created.")
 
 
 async def make_voice(text):
@@ -143,13 +219,16 @@ async def make_voice(text):
         text,
         "en-US-AndrewNeural"
     )
+
     await voice.save(AUDIO)
+    print("Narration created.")
 
 
 def make_video():
     command = [
         "ffmpeg", "-y",
-        "-loop", "1", "-framerate", "30",
+        "-loop", "1",
+        "-framerate", "30",
         "-i", POSTER,
         "-i", AUDIO,
         "-vf",
@@ -164,6 +243,7 @@ def make_video():
     ]
 
     subprocess.run(command, check=True)
+    print("Video created successfully.")
 
 
 def upload_video(story):
@@ -188,7 +268,10 @@ def upload_video(story):
     body = {
         "snippet": {
             "title": story["title"][:100],
-            "description": story["description"] + "\n#MysteryVerse #Shorts",
+            "description": (
+                story["description"] +
+                "\n#MysteryVerse #Shorts"
+            ),
             "categoryId": "24",
             "defaultLanguage": "en"
         },
@@ -210,13 +293,18 @@ def upload_video(story):
         media_body=media
     ).execute()
 
-    print("Private video uploaded:", result["id"])
+    print("Private video uploaded successfully!")
+    print("YouTube video ID:", result["id"])
 
 
 if __name__ == "__main__":
+    print("Starting MysteryVerse automation...")
+
     story = generate_story()
     make_poster(story["title"], story["narration"])
     asyncio.run(make_voice(story["narration"]))
     make_video()
     upload_video(story)
-  
+
+    print("MysteryVerse automation completed!")
+    
