@@ -32,8 +32,8 @@ Keep title under 80 characters.
 """
 
     url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-3.8-flash:generateContent"
+ "https://generativelanguage.googleapis.com/v1beta/"
+"models/gemini-3.5-flash-lite:generateContent"
     )
 
     # Retry Gemini requests if the server is slow or temporarily unavailable.
