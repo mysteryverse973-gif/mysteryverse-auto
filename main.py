@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -12,17 +13,30 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# =====================================
+# MYSTERYVERSE CONFIGURATION
+# =====================================
+
 VIDEO = "mysteryverse_short.mp4"
 AUDIO = "narration.mp3"
 CLIP_DIR = "clips"
 
 HEADERS = {
-    "User-Agent": "MysteryVerseBot/1.0 (video creator)"
+    "User-Agent": "MysteryVerseBot/1.0 (automated video creator)"
 }
 
+MAX_CLIP_SIZE = 60 * 1024 * 1024
+MIN_CLIPS = 4
+MAX_CLIPS = 8
+CLIP_SECONDS = 8
 
-def run(cmd):
-    subprocess.run(cmd, check=True)
+
+# =====================================
+# GENERAL HELPERS
+# =====================================
+
+def run(command):
+    subprocess.run(command, check=True)
 
 
 def duration(path):
@@ -33,40 +47,71 @@ def duration(path):
             "-of", "default=noprint_wrappers=1:nokey=1",
             path
         ],
-        capture_output=True, text=True, check=True
+        capture_output=True,
+        text=True,
+        check=True
     )
     return float(result.stdout.strip())
 
 
+def request_with_retry(method, url, **kwargs):
+    for attempt in range(4):
+        response = requests.request(
+            method,
+            url,
+            headers=kwargs.pop("headers", HEADERS),
+            **kwargs
+        )
+
+        if response.status_code in (429, 500, 502, 503, 504):
+            wait = 10 * (attempt + 1)
+            print(f"Server busy ({response.status_code}). Waiting {wait}s.")
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    raise RuntimeError("Request failed after multiple retries: " + url)
+
+
+# =====================================
+# AI STORY GENERATION
+# =====================================
+
 def generate_story():
     prompt = """
 Create an original fictional mystery story for an English YouTube Short.
-Return valid JSON with:
+
+Return valid JSON with these fields:
 title, narration, description, tags, hashtags.
 
 Rules:
-- Narration: 70-90 spoken English words.
-- Strong suspense hook in the first sentence.
-- Family-friendly fictional mystery.
-- Title under 80 characters.
-- Description 2-4 sentences.
-- tags and hashtags must be lists.
-- Never claim the story is real.
+- Narration must contain 70-90 spoken English words.
+- Start with a powerful suspense hook.
+- Make the story family-friendly.
+- Make the ending surprising.
+- Title must be under 80 characters.
+- Description must be 2-4 sentences.
+- tags and hashtags must be lists of strings.
+- Never claim the fictional story is real.
 """
+
+    api_key = os.environ["GEMINI_API_KEY"]
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
         "models/gemini-3.5-flash-lite:generateContent"
     )
 
-    key = os.environ["GEMINI_API_KEY"]
-
     for attempt in range(4):
         response = requests.post(
             url,
-            params={"key": key},
+            params={"key": api_key},
             json={
-                "contents": [{"parts": [{"text": prompt}]}],
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ],
                 "generationConfig": {
                     "responseMimeType": "application/json"
                 }
@@ -79,30 +124,55 @@ Rules:
             continue
 
         response.raise_for_status()
+
         candidates = response.json().get("candidates", [])
 
         if not candidates:
-            raise RuntimeError("No story returned by Gemini.")
+            raise RuntimeError("Gemini returned no story.")
 
-        story = json.loads(
-            candidates[0]["content"]["parts"][0]["text"]
-        )
+        raw_text = candidates[0]["content"]["parts"][0]["text"]
+        story = json.loads(raw_text)
 
         for field in ("title", "narration", "description"):
             if not story.get(field):
                 raise ValueError("Missing story field: " + field)
 
+        if not isinstance(story.get("tags", []), list):
+            story["tags"] = []
+
+        if not isinstance(story.get("hashtags", []), list):
+            story["hashtags"] = []
+
+        story["title"] = str(story["title"])[:80]
+        story["narration"] = str(story["narration"])
+        story["description"] = str(story["description"])
+
+        print("Story generated:", story["title"])
         return story
 
-    raise RuntimeError("Story generation failed.")
+    raise RuntimeError("Story generation failed after retries.")
 
+
+# =====================================
+# AI VOICE
+# =====================================
 
 async def create_voice(text):
     voice = edge_tts.Communicate(
-        text, "en-US-AndrewNeural"
+        text,
+        "en-US-AndrewNeural"
     )
     await voice.save(AUDIO)
 
+    if not os.path.exists(AUDIO) or os.path.getsize(AUDIO) == 0:
+        raise RuntimeError("Voice narration was not created.")
+
+    print("Voice narration created.")
+
+
+# =====================================
+# SEARCH TERMS
+# =====================================
 
 def search_terms(story):
     words = re.findall(
@@ -115,150 +185,78 @@ def search_terms(story):
         "could", "about", "after", "before", "while",
         "never", "every", "because", "someone",
         "something", "inside", "heard", "looked",
-        "turned", "found", "story"
+        "turned", "found", "story", "then", "when",
+        "that", "this", "with", "from"
     }
 
-    result = []
+    terms = []
 
     for word in words:
-        if word not in ignored and word not in result:
-            result.append(word)
+        if word not in ignored and word not in terms:
+            terms.append(word)
 
-        if len(result) == 6:
+        if len(terms) >= 6:
             break
 
-    return result or ["dark forest", "abandoned house"]
+    if not terms:
+        terms = ["dark forest", "abandoned house"]
+
+    return terms
 
 
-# -----------------------------
-# SOURCE 1: WIKIMEDIA COMMONS
-# -----------------------------
-
-def allowed_commons_license(metadata):
-    name = metadata.get(
-        "LicenseShortName", {}
-    ).get("value", "").lower()
-
-    url = metadata.get(
-        "LicenseUrl", {}
-    ).get("value", "").lower()
-
-    text = name + " " + url
-
-    allowed = (
-        "cc0" in text
-        or "public domain" in text
-        or "cc by" in text
-        or "cc-by" in text
-    )
-
-    forbidden = any(x in text for x in [
-        "by-nc", "by-nd", "noncommercial",
-        "no derivatives"
-    ])
-
-    return allowed and not forbidden
-
-
-def search_commons(query):
-    params = {
-        "action": "query",
-        "format": "json",
-        "generator": "search",
-        "gsrnamespace": 6,
-        "gsrlimit": 20,
-        "gsrsearch": query,
-        "prop": "imageinfo",
-        "iiprop": "url|mime|extmetadata"
-    }
-
-    response = requests.get(
-        "https://commons.wikimedia.org/w/api.php",
-        params=params,
-        headers=HEADERS,
-        timeout=45
-    )
-    response.raise_for_status()
-
-    pages = response.json().get(
-        "query", {}
-    ).get("pages", {})
-
-    found = []
-
-    for page in pages.values():
-        info = (page.get("imageinfo") or [{}])[0]
-        metadata = info.get("extmetadata", {})
-
-        if not info.get("mime", "").lower().startswith("video/"):
-            continue
-
-        if not allowed_commons_license(metadata):
-            continue
-
-        url = info.get("url", "")
-
-        if not url.startswith("https://"):
-            continue
-
-        found.append({
-            "url": url,
-            "title": page.get("title", "Video"),
-            "license": metadata.get(
-                "LicenseShortName", {}
-            ).get("value", "Unknown"),
-            "artist": metadata.get(
-                "Artist", {}
-            ).get("value", "Unknown"),
-            "source": "Wikimedia Commons"
-        })
-
-    return found
-
-
-# -----------------------------
-# SOURCE 2: INTERNET ARCHIVE
-# -----------------------------
+# =====================================
+# INTERNET ARCHIVE LICENCE CHECK
+# Wikimedia is intentionally disabled.
+# =====================================
 
 def allowed_archive_license(license_url):
-    value = (license_url or "").lower().strip()
+    value = str(license_url or "").lower().strip()
 
     if not value:
         return False
 
-    if any(x in value for x in (
-        "by-nc", "by-nd", "noncommercial",
+    forbidden = (
+        "by-nc",
+        "by-nd",
+        "noncommercial",
         "no-derivatives"
-    )):
+    )
+
+    if any(word in value for word in forbidden):
         return False
 
-    return any(x in value for x in (
+    allowed = (
         "creativecommons.org/publicdomain/zero",
         "creativecommons.org/publicdomain/mark",
         "creativecommons.org/licenses/by/",
         "creativecommons.org/licenses/by-sa/"
-    ))
+    )
 
+    return any(word in value for word in allowed)
+
+
+# =====================================
+# INTERNET ARCHIVE SEARCH
+# =====================================
 
 def search_archive(query):
     params = {
         "q": (
-            f'mediatype:movies AND '
+            'mediatype:movies AND '
             f'(title:"{query}" OR subject:"{query}")'
         ),
         "fl[]": ["identifier", "title"],
-        "rows": 8,
+        "rows": 10,
         "page": 1,
         "output": "json"
     }
 
-    response = requests.get(
+    response = request_with_retry(
+        "GET",
         "https://archive.org/advancedsearch.php",
         params=params,
-        headers=HEADERS,
-        timeout=45
+        timeout=60
     )
-    response.raise_for_status()
 
     docs = response.json().get(
         "response", {}
@@ -273,12 +271,11 @@ def search_archive(query):
             continue
 
         try:
-            metadata_response = requests.get(
+            metadata_response = request_with_retry(
+                "GET",
                 f"https://archive.org/metadata/{identifier}",
-                headers=HEADERS,
-                timeout=45
+                timeout=60
             )
-            metadata_response.raise_for_status()
 
             record = metadata_response.json()
             metadata = record.get("metadata", {})
@@ -290,22 +287,28 @@ def search_archive(query):
                     license_url[0] if license_url else ""
                 )
 
-            if not allowed_archive_license(str(license_url)):
+            if not allowed_archive_license(license_url):
+                print("Skipping item with unapproved licence:", identifier)
                 continue
 
             video_files = []
 
             for entry in record.get("files", []):
-                name = entry.get("name", "")
-                lower = name.lower()
-                fmt = str(entry.get("format", "")).lower()
+                filename = entry.get("name", "")
+                lower = filename.lower()
+                file_format = str(
+                    entry.get("format", "")
+                ).lower()
 
                 if not lower.endswith((
                     ".mp4", ".m4v", ".mov", ".webm"
                 )):
                     continue
 
-                if "thumbnail" in fmt or "animated gif" in fmt:
+                if "thumbnail" in file_format:
+                    continue
+
+                if "animated gif" in file_format:
                     continue
 
                 try:
@@ -313,19 +316,26 @@ def search_archive(query):
                 except (TypeError, ValueError):
                     size = 0
 
-                if size and size > 60 * 1024 * 1024:
+                if size and size > MAX_CLIP_SIZE:
                     continue
 
                 priority = 0 if lower.endswith(".mp4") else 1
-                video_files.append((priority, name))
+                video_files.append((priority, filename))
 
             if not video_files:
                 continue
 
-            video_files.sort()
+            video_files.sort(key=lambda item: item[0])
+
             filename = requests.utils.quote(
-                video_files[0][1], safe="/"
+                video_files[0][1],
+                safe="/"
             )
+
+            creator = metadata.get("creator", "Unknown")
+
+            if isinstance(creator, list):
+                creator = ", ".join(str(x) for x in creator)
 
             found.append({
                 "url": (
@@ -334,31 +344,33 @@ def search_archive(query):
                 ),
                 "title": str(
                     metadata.get(
-                        "title", doc.get("title", identifier)
+                        "title",
+                        doc.get("title", identifier)
                     )
                 ),
                 "license": str(license_url),
-                "artist": str(
-                    metadata.get("creator", "Unknown")
-                ),
+                "artist": str(creator),
                 "source": "Internet Archive"
             })
 
         except Exception as error:
             print("Archive item skipped:", error)
 
+        time.sleep(1)
+
     return found
 
 
-# -----------------------------
-# VIDEO DOWNLOAD AND EDITING
-# -----------------------------
+# =====================================
+# DOWNLOAD VIDEO CLIPS
+# =====================================
 
 def download_clip(item, number):
     os.makedirs(CLIP_DIR, exist_ok=True)
 
     path = os.path.join(
-        CLIP_DIR, f"source_{number}.video"
+        CLIP_DIR,
+        f"source_{number}.video"
     )
 
     response = requests.get(
@@ -367,24 +379,32 @@ def download_clip(item, number):
         stream=True,
         timeout=(30, 120)
     )
+
     response.raise_for_status()
 
     total = 0
 
-    with open(path, "wb") as file:
+    with open(path, "wb") as output:
         for chunk in response.iter_content(262144):
             if not chunk:
                 continue
 
             total += len(chunk)
 
-            if total > 60 * 1024 * 1024:
-                raise ValueError("Clip too large.")
+            if total > MAX_CLIP_SIZE:
+                raise ValueError("Clip exceeded size limit.")
 
-            file.write(chunk)
+            output.write(chunk)
+
+    if total == 0:
+        raise RuntimeError("Downloaded clip is empty.")
 
     return path
 
+
+# =====================================
+# VIDEO CREATION
+# =====================================
 
 def create_moving_video(story):
     if os.path.exists(CLIP_DIR):
@@ -399,21 +419,22 @@ def create_moving_video(story):
     found = []
     seen = set()
 
-    # Search both video libraries.
+    # Internet Archive only: no Wikimedia requests.
     for term in search_terms(story):
-        for source_name, search_function in (
-            ("Wikimedia Commons", search_commons),
-            ("Internet Archive", search_archive)
-        ):
-            try:
-                for item in search_function(term):
-                    if item["url"] not in seen:
-                        seen.add(item["url"])
-                        item.setdefault("source", source_name)
-                        found.append(item)
+        try:
+            print("Searching Internet Archive:", term)
 
-            except Exception as error:
-                print(source_name, "search error:", error)
+            for item in search_archive(term):
+                if item["url"] not in seen:
+                    seen.add(item["url"])
+                    found.append(item)
+
+        except Exception as error:
+            print("Archive search failed:", error)
+
+        time.sleep(2)
+
+    print("Unique footage candidates:", len(found))
 
     segments = []
     credits = []
@@ -421,25 +442,28 @@ def create_moving_video(story):
     for item in found:
         try:
             number = len(segments) + 1
-            source = download_clip(item, number)
+
+            source_path = download_clip(item, number)
 
             segment = os.path.join(
-                CLIP_DIR, f"scene_{number}.mp4"
+                CLIP_DIR,
+                f"scene_{number}.mp4"
             )
 
             run([
                 "ffmpeg", "-y",
-                "-i", source,
-                "-t", "8",
+                "-i", source_path,
+                "-t", str(CLIP_SECONDS),
                 "-an",
                 "-vf",
                 "scale=1080:1920:"
                 "force_original_aspect_ratio=increase,"
-                "crop=1080:1920,fps=30,setsar=1,"
-                "format=yuv420p",
+                "crop=1080:1920,"
+                "fps=30,setsar=1,format=yuv420p",
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "24",
+                "-movflags", "+faststart",
                 segment
             ])
 
@@ -447,51 +471,63 @@ def create_moving_video(story):
                 segments.append(segment)
 
                 credits.append(
-                    f'{item["title"]} | {item["license"]} | '
-                    f'{item["artist"]} | {item["url"]}'
+                    f'{item["title"]} | '
+                    f'{item["license"]} | '
+                    f'{item["artist"]} | '
+                    f'{item["url"]}'
                 )
 
-            if len(segments) >= 8:
+                print("Usable clip:", len(segments))
+
+            else:
+                print("Clip too short; skipped.")
+
+            if len(segments) >= MAX_CLIPS:
                 break
 
         except Exception as error:
-            print("Skipping clip:", error)
+            print("Skipping footage:", error)
 
-    # Safety: do not upload if fewer than four clips exist.
-    if len(segments) < 4:
+    # Fail safely instead of uploading an incomplete video.
+    if len(segments) < MIN_CLIPS:
         raise RuntimeError(
-            "Upload cancelled: fewer than 4 moving clips."
+            f"Upload cancelled: only {len(segments)} usable clips. "
+            f"At least {MIN_CLIPS} are required."
         )
 
     audio_duration = duration(AUDIO)
 
-    total_visual_duration = sum(
+    visual_duration = sum(
         duration(path) for path in segments
     )
 
-    if total_visual_duration < audio_duration:
+    if visual_duration < audio_duration:
         raise RuntimeError(
-            "Upload cancelled: moving scenes are too short."
+            "Upload cancelled: footage is shorter than narration."
         )
 
     concat_file = os.path.join(
-        CLIP_DIR, "concat.txt"
+        CLIP_DIR,
+        "concat.txt"
     )
 
     with open(
-        concat_file, "w", encoding="utf-8"
-    ) as file:
+        concat_file,
+        "w",
+        encoding="utf-8"
+    ) as output:
         for path in segments:
             absolute = os.path.abspath(path)
 
-            file.write(
-                "file '" +
-                absolute.replace("'", "'\\''") +
-                "'\n"
+            safe_path = absolute.replace("'", "'\\''")
+
+            output.write(
+                f"file '{safe_path}'\n"
             )
 
     visuals = os.path.join(
-        CLIP_DIR, "visuals.mp4"
+        CLIP_DIR,
+        "visuals.mp4"
     )
 
     run([
@@ -503,6 +539,7 @@ def create_moving_video(story):
         visuals
     ])
 
+    # Combine footage and narration into a vertical Short.
     run([
         "ffmpeg", "-y",
         "-i", visuals,
@@ -512,7 +549,8 @@ def create_moving_video(story):
         "-vf",
         "scale=1080:1920:"
         "force_original_aspect_ratio=increase,"
-        "crop=1080:1920,fps=30,format=yuv420p",
+        "crop=1080:1920,"
+        "fps=30,format=yuv420p",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
@@ -523,19 +561,21 @@ def create_moving_video(story):
         VIDEO
     ])
 
-    if duration(VIDEO) < audio_duration * 0.95:
+    final_duration = duration(VIDEO)
+
+    if final_duration < audio_duration * 0.95:
         raise RuntimeError(
-            "Final video failed duration check."
+            "Final video failed duration validation."
         )
 
-    print("Moving-scene video created.")
+    print("Final vertical video created:", final_duration, "seconds")
 
     return credits
 
 
-# -----------------------------
-# PRIVATE YOUTUBE UPLOAD
-# -----------------------------
+# =====================================
+# YOUTUBE PRIVATE UPLOAD
+# =====================================
 
 def upload_to_youtube(story, credits):
     credentials = Credentials(
@@ -552,13 +592,14 @@ def upload_to_youtube(story, credits):
     credentials.refresh(Request())
 
     youtube = build(
-        "youtube", "v3",
+        "youtube",
+        "v3",
         credentials=credentials,
         cache_discovery=False
     )
 
     hashtags = " ".join(
-        "#" + str(tag).lstrip("#")
+        "#" + str(tag).strip().lstrip("#").replace(" ", "")
         for tag in story.get(
             "hashtags",
             ["MysteryVerse", "Mystery", "Shorts"]
@@ -573,11 +614,16 @@ def upload_to_youtube(story, credits):
         + "\n".join(credits)
     )
 
+    tags = [
+        str(tag)[:100]
+        for tag in story.get("tags", [])[:15]
+    ]
+
     body = {
         "snippet": {
             "title": story["title"][:100],
             "description": description[:5000],
-            "tags": story.get("tags", [])[:15],
+            "tags": tags,
             "categoryId": "24",
             "defaultLanguage": "en",
             "defaultAudioLanguage": "en"
@@ -600,11 +646,37 @@ def upload_to_youtube(story, credits):
         media_body=media
     ).execute()
 
-    print("Private upload successful:", result["id"])
+    print("Private YouTube upload successful.")
+    print("Video ID:", result["id"])
+    print("Video URL:", "https://youtube.com/watch?v=" + result["id"])
 
+
+# =====================================
+# MAIN AUTOMATION
+# =====================================
 
 if __name__ == "__main__":
-    print("Starting MysteryVerse...")
+    print("================================")
+    print("Starting MysteryVerse Automation")
+    print("================================")
+
+    required_secrets = [
+        "GEMINI_API_KEY",
+        "YOUTUBE_CLIENT_ID",
+        "YOUTUBE_CLIENT_SECRET",
+        "YOUTUBE_REFRESH_TOKEN"
+    ]
+
+    missing = [
+        name for name in required_secrets
+        if not os.environ.get(name)
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Missing GitHub Actions secrets: "
+            + ", ".join(missing)
+        )
 
     story = generate_story()
 
@@ -614,8 +686,11 @@ if __name__ == "__main__":
 
     credits = create_moving_video(story)
 
-    # Upload only after all video checks pass.
+    # Upload happens only after all video checks pass.
     upload_to_youtube(story, credits)
 
-    print("MysteryVerse completed.")
+    print("================================")
+    print("MysteryVerse completed successfully.")
+    print("Upload privacy: PRIVATE")
+    print("================================")
     
