@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -12,10 +13,6 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# =====================================
-# MYSTERYVERSE CONFIGURATION
-# =====================================
-
 VIDEO = "mysteryverse_short.mp4"
 AUDIO = "narration.mp3"
 CLIP_DIR = "clips"
@@ -25,14 +22,9 @@ HEADERS = {
 }
 
 MAX_CLIP_SIZE = 60 * 1024 * 1024
-MIN_CLIPS = 4
 MAX_CLIPS = 8
 CLIP_SECONDS = 8
 
-
-# =====================================
-# GENERAL HELPERS
-# =====================================
 
 def run(command):
     subprocess.run(command, check=True)
@@ -54,24 +46,26 @@ def duration(path):
 
 
 def request_with_retry(method, url, **kwargs):
+    headers = kwargs.pop("headers", HEADERS)
+
     for attempt in range(4):
         response = requests.request(
             method,
             url,
-            headers=kwargs.pop("headers", HEADERS),
+            headers=headers,
             **kwargs
         )
 
         if response.status_code in (429, 500, 502, 503, 504):
             wait = 10 * (attempt + 1)
-            print(f"Server busy ({response.status_code}). Waiting {wait}s.")
+            print(f"Server busy. Waiting {wait}s.")
             time.sleep(wait)
             continue
 
         response.raise_for_status()
         return response
 
-    raise RuntimeError("Request failed after multiple retries: " + url)
+    raise RuntimeError("Request failed after retries: " + url)
 
 
 # =====================================
@@ -204,8 +198,7 @@ def search_terms(story):
 
 
 # =====================================
-# INTERNET ARCHIVE LICENCE CHECK
-# Wikimedia is intentionally disabled.
+# LICENCE CHECK
 # =====================================
 
 def allowed_archive_license(license_url):
@@ -282,12 +275,10 @@ def search_archive(query):
             license_url = metadata.get("licenseurl", "")
 
             if isinstance(license_url, list):
-                license_url = (
-                    license_url[0] if license_url else ""
-                )
+                license_url = license_url[0] if license_url else ""
 
             if not allowed_archive_license(license_url):
-                print("Skipping item with unapproved licence:", identifier)
+                print("Skipping unapproved licence:", identifier)
                 continue
 
             video_files = []
@@ -295,9 +286,7 @@ def search_archive(query):
             for entry in record.get("files", []):
                 filename = entry.get("name", "")
                 lower = filename.lower()
-                file_format = str(
-                    entry.get("format", "")
-                ).lower()
+                file_format = str(entry.get("format", "")).lower()
 
                 if not lower.endswith((
                     ".mp4", ".m4v", ".mov", ".webm"
@@ -342,10 +331,7 @@ def search_archive(query):
                     f"{identifier}/{filename}"
                 ),
                 "title": str(
-                    metadata.get(
-                        "title",
-                        doc.get("title", identifier)
-                    )
+                    metadata.get("title", doc.get("title", identifier))
                 ),
                 "license": str(license_url),
                 "artist": str(creator),
@@ -361,7 +347,7 @@ def search_archive(query):
 
 
 # =====================================
-# DOWNLOAD VIDEO CLIPS
+# DOWNLOAD CLIP
 # =====================================
 
 def download_clip(item, number):
@@ -418,7 +404,6 @@ def create_moving_video(story):
     found = []
     seen = set()
 
-    # Internet Archive only: no Wikimedia requests.
     for term in search_terms(story):
         try:
             print("Searching Internet Archive:", term)
@@ -441,7 +426,6 @@ def create_moving_video(story):
     for item in found:
         try:
             number = len(segments) + 1
-
             source_path = download_clip(item, number)
 
             segment = os.path.join(
@@ -487,47 +471,79 @@ def create_moving_video(story):
         except Exception as error:
             print("Skipping footage:", error)
 
-    # Fail safely instead of uploading an incomplete video.
-    if len(segments) < MIN_CLIPS:
+    # At least one approved clip is required.
+    if not segments:
         raise RuntimeError(
-            f"Upload cancelled: only {len(segments)} usable clips. "
-            f"At least {MIN_CLIPS} are required."
+            "Upload cancelled: no usable footage with an approved licence."
         )
 
     audio_duration = duration(AUDIO)
 
-    visual_duration = sum(
-        duration(path) for path in segments
-    )
+    # Repeat verified footage until it covers the narration.
+    playlist = []
+    visual_duration = 0
+    repeat_index = 0
 
-    if visual_duration < audio_duration:
-        raise RuntimeError(
-            "Upload cancelled: footage is shorter than narration."
+    while visual_duration < audio_duration:
+        source = segments[repeat_index % len(segments)]
+        scene_number = len(playlist) + 1
+
+        # Create visual variations for repeated footage.
+        variant = os.path.join(
+            CLIP_DIR,
+            f"variant_{scene_number}.mp4"
         )
 
-    concat_file = os.path.join(
-        CLIP_DIR,
-        "concat.txt"
+        if repeat_index == 0:
+            run([
+                "ffmpeg", "-y",
+                "-i", source,
+                "-c", "copy",
+                variant
+            ])
+        elif repeat_index % 2 == 1:
+            run([
+                "ffmpeg", "-y",
+                "-i", source,
+                "-vf", "hflip,eq=brightness=0.02",
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "24",
+                "-pix_fmt", "yuv420p",
+                variant
+            ])
+        else:
+            run([
+                "ffmpeg", "-y",
+                "-i", source,
+                "-vf", "eq=brightness=-0.02:saturation=1.15",
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "24",
+                "-pix_fmt", "yuv420p",
+                variant
+            ])
+
+        playlist.append(variant)
+        visual_duration += duration(variant)
+        repeat_index += 1
+
+    print(
+        f"Using {len(segments)} unique licensed clip(s) "
+        f"across {len(playlist)} scenes."
     )
 
-    with open(
-        concat_file,
-        "w",
-        encoding="utf-8"
-    ) as output:
-        for path in segments:
+    concat_file = os.path.join(CLIP_DIR, "concat.txt")
+
+    with open(concat_file, "w", encoding="utf-8") as output:
+        for path in playlist:
             absolute = os.path.abspath(path)
-
             safe_path = absolute.replace("'", "'\\''")
+            output.write(f"file '{safe_path}'\n")
 
-            output.write(
-                f"file '{safe_path}'\n"
-            )
-
-    visuals = os.path.join(
-        CLIP_DIR,
-        "visuals.mp4"
-    )
+    visuals = os.path.join(CLIP_DIR, "visuals.mp4")
 
     run([
         "ffmpeg", "-y",
@@ -538,7 +554,6 @@ def create_moving_video(story):
         visuals
     ])
 
-    # Combine footage and narration into a vertical Short.
     run([
         "ffmpeg", "-y",
         "-i", visuals,
@@ -567,7 +582,7 @@ def create_moving_video(story):
             "Final video failed duration validation."
         )
 
-    print("Final vertical video created:", final_duration, "seconds")
+    print("Final video created:", final_duration, "seconds")
 
     return credits
 
@@ -647,7 +662,10 @@ def upload_to_youtube(story, credits):
 
     print("Private YouTube upload successful.")
     print("Video ID:", result["id"])
-    print("Video URL:", "https://youtube.com/watch?v=" + result["id"])
+    print(
+        "Video URL:",
+        "https://youtube.com/watch?v=" + result["id"]
+    )
 
 
 # =====================================
@@ -685,11 +703,11 @@ if __name__ == "__main__":
 
     credits = create_moving_video(story)
 
-    # Upload happens only after all video checks pass.
+    # Upload only after video creation and validation succeed.
     upload_to_youtube(story, credits)
 
     print("================================")
     print("MysteryVerse completed successfully.")
     print("Upload privacy: PRIVATE")
     print("================================")
-    
+            
