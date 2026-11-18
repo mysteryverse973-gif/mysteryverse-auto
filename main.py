@@ -1,3 +1,4 @@
+
 import os
 import json
 import asyncio
@@ -18,34 +19,106 @@ POSTER = "poster.png"
 AUDIO = "narration.mp3"
 
 
+def clean_metadata(story):
+    raw_tags = story.get("tags", [])
+    if not isinstance(raw_tags, list):
+        raw_tags = []
+
+    tags = []
+    for item in raw_tags:
+        if isinstance(item, str):
+            tag = " ".join(item.replace("#", "").split()).strip()
+            if tag and tag.lower() not in [x.lower() for x in tags]:
+                tags.append(tag[:40])
+
+    fallback_tags = [
+        "mystery story",
+        "mystery shorts",
+        "short mystery",
+        "fictional mystery",
+        "mystery storytelling",
+        "short stories",
+        "MysteryVerse"
+    ]
+
+    for tag in fallback_tags:
+        if tag.lower() not in [x.lower() for x in tags]:
+            tags.append(tag)
+
+    final_tags = []
+    total_chars = 0
+
+    for tag in tags:
+        extra = len(tag) + (1 if final_tags else 0)
+        if total_chars + extra <= 500:
+            final_tags.append(tag)
+            total_chars += extra
+
+    story["tags"] = final_tags
+
+    raw_hashtags = story.get("hashtags", [])
+    if not isinstance(raw_hashtags, list):
+        raw_hashtags = []
+
+    hashtags = []
+
+    for item in raw_hashtags:
+        if isinstance(item, str):
+            value = "".join(
+                ch for ch in item.replace("#", "")
+                if ch.isalnum() or ch == "_"
+            )
+            if value and value.lower() not in [x.lower() for x in hashtags]:
+                hashtags.append(value[:30])
+
+    for item in ["MysteryVerse", "Mystery", "Shorts"]:
+        if item.lower() not in [x.lower() for x in hashtags]:
+            hashtags.append(item)
+
+    story["hashtags"] = hashtags[:5]
+
+    return story
+
+
 def generate_story():
     key = os.environ["GEMINI_API_KEY"]
 
     prompt = """
-Create one original, fictional, family-friendly mystery story
+Create one original fictional mystery story
 for an English YouTube Short.
-Narration must be 70-90 words, with a strong opening hook.
-Do not use real people's names or present fiction as fact.
-Return JSON only with these keys:
-title, narration, description.
-Keep title under 80 characters.
+
+Return valid JSON only with these keys:
+title, narration, description, tags, hashtags.
+
+Rules:
+- Title: compelling English title under 80 characters.
+- Narration: 70-90 spoken English words with a strong hook.
+- Description: 2-4 natural English sentences about the story.
+- Never claim the fictional story is true.
+- Tags: array of 8-15 relevant YouTube search tags.
+- Hashtags: array of 3-5 relevant hashtags.
+- Do not include # symbols inside tags or hashtags.
+- Avoid unrelated trending keywords.
+- Keep the story family-friendly.
+- Do not use real people's names.
 """
 
     url = (
- "https://generativelanguage.googleapis.com/v1beta/"
-"models/gemini-3.5-flash-lite:generateContent"
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-3.5-flash-lite:generateContent"
     )
 
-    # Retry Gemini requests if the server is slow or temporarily unavailable.
     for attempt in range(4):
         try:
-            print(f"Generating story with Gemini (attempt {attempt + 1}/4)...")
+            print(f"Generating story (attempt {attempt + 1}/4)...")
 
             response = requests.post(
                 url,
                 params={"key": key},
                 json={
-                    "contents": [{"parts": [{"text": prompt}]}],
+                    "contents": [
+                        {"parts": [{"text": prompt}]}
+                    ],
                     "generationConfig": {
                         "responseMimeType": "application/json"
                     }
@@ -53,51 +126,48 @@ Keep title under 80 characters.
                 timeout=(20, 300)
             )
 
-            # Retry temporary server errors and rate limits.
             if response.status_code in (429, 500, 502, 503, 504):
                 if attempt < 3:
                     wait = 15 * (attempt + 1)
-                    print(
-                        f"Gemini temporarily unavailable "
-                        f"({response.status_code}). Retrying in {wait}s..."
-                    )
+                    print(f"Gemini busy. Retrying in {wait}s...")
                     time.sleep(wait)
                     continue
 
             response.raise_for_status()
 
             result = response.json()
+            candidates = result.get("candidates", [])
 
-            if "candidates" not in result or not result["candidates"]:
-                raise RuntimeError(
-                    f"Gemini returned no candidates: {result}"
-                )
+            if not candidates:
+                raise RuntimeError("Gemini returned no story.")
 
-            text = result["candidates"][0]["content"]["parts"][0]["text"]
-            story = json.loads(text)
+            story_text = candidates[0]["content"]["parts"][0]["text"]
+            story = json.loads(story_text)
 
             for field in ("title", "narration", "description"):
-                if not story.get(field):
-                    raise ValueError(f"Gemini response missing: {field}")
+                if not isinstance(story.get(field), str) or not story[field].strip():
+                    raise ValueError(f"Missing field: {field}")
+
+            story = clean_metadata(story)
 
             print("Story generated successfully.")
+            print("SEO tags:", len(story["tags"]))
+            print("Hashtags:", len(story["hashtags"]))
+
             return story
 
         except (
             requests.exceptions.Timeout,
             requests.exceptions.ConnectionError
-        ) as error:
+        ):
             if attempt == 3:
                 raise
 
             wait = 15 * (attempt + 1)
-            print(
-                f"Gemini connection problem: {error.__class__.__name__}. "
-                f"Retrying in {wait}s..."
-            )
+            print(f"Connection problem. Retrying in {wait}s...")
             time.sleep(wait)
 
-    raise RuntimeError("Gemini could not generate a story after 4 attempts.")
+    raise RuntimeError("Gemini failed after 4 attempts.")
 
 
 def make_poster(title, narration):
@@ -137,6 +207,7 @@ def make_poster(title, narration):
         font=small,
         fill="white"
     )
+
     draw.text(
         (65, 250),
         "TONIGHT'S",
@@ -144,14 +215,15 @@ def make_poster(title, narration):
         fill=(120, 190, 255)
     )
 
-    words = title.split()
-    lines, line = [], ""
+    lines = []
+    line = ""
 
-    for word in words:
+    for word in title.split():
         test = (line + " " + word).strip()
 
         if draw.textbbox((0, 0), test, font=big)[2] > 930:
-            lines.append(line)
+            if line:
+                lines.append(line)
             line = word
         else:
             line = test
@@ -176,15 +248,15 @@ def make_poster(title, narration):
         fill=(22, 30, 55)
     )
 
-    excerpt = narration[:260]
-    words = excerpt.split()
-    lines, line = [], ""
+    lines = []
+    line = ""
 
-    for word in words:
+    for word in narration[:260].split():
         test = (line + " " + word).strip()
 
         if draw.textbbox((0, 0), test, font=medium)[2] > 870:
-            lines.append(line)
+            if line:
+                lines.append(line)
             line = word
         else:
             line = test
@@ -205,7 +277,7 @@ def make_poster(title, narration):
 
     draw.text(
         (65, 1700),
-        "LISTEN CLOSELY • THE CLUE IS HIDDEN",
+        "LISTEN CLOSELY - THE CLUE IS HIDDEN",
         font=small,
         fill=(120, 190, 255)
     )
@@ -221,7 +293,7 @@ async def make_voice(text):
     )
 
     await voice.save(AUDIO)
-    print("Narration created.")
+    print("English narration created.")
 
 
 def make_video():
@@ -265,15 +337,28 @@ def upload_video(story):
         cache_discovery=False
     )
 
+    hashtags = " ".join(
+        "#" + h for h in story.get(
+            "hashtags",
+            ["MysteryVerse", "Mystery", "Shorts"]
+        )
+    )
+
+    description = (
+        story["description"].strip()
+        + "\n\nFollow MysteryVerse for more original mystery stories."
+        + "\n\n"
+        + hashtags
+    )[:5000]
+
     body = {
         "snippet": {
             "title": story["title"][:100],
-            "description": (
-                story["description"] +
-                "\n#MysteryVerse #Shorts"
-            ),
+            "description": description,
+            "tags": story.get("tags", [])[:15],
             "categoryId": "24",
-            "defaultLanguage": "en"
+            "defaultLanguage": "en",
+            "defaultAudioLanguage": "en"
         },
         "status": {
             "privacyStatus": "private",
