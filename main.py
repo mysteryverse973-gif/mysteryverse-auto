@@ -1,10 +1,10 @@
 
 import os
+import re
 import json
+import time
 import asyncio
 import subprocess
-import random
-import time
 import requests
 import edge_tts
 
@@ -15,92 +15,51 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 VIDEO = "mysteryverse_short.mp4"
-POSTER = "poster.png"
 AUDIO = "narration.mp3"
+POSTER = "poster.png"
+CLIP_DIR = "commons_clips"
+
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+HEADERS = {
+    "User-Agent": "MysteryVerseBot/1.0 (video creator)"
+}
 
 
-def clean_metadata(story):
-    raw_tags = story.get("tags", [])
-    if not isinstance(raw_tags, list):
-        raw_tags = []
+def run(command):
+    subprocess.run(command, check=True)
 
-    tags = []
-    for item in raw_tags:
-        if isinstance(item, str):
-            tag = " ".join(item.replace("#", "").split()).strip()
-            if tag and tag.lower() not in [x.lower() for x in tags]:
-                tags.append(tag[:40])
 
-    fallback_tags = [
-        "mystery story",
-        "mystery shorts",
-        "short mystery",
-        "fictional mystery",
-        "mystery storytelling",
-        "short stories",
-        "MysteryVerse"
-    ]
-
-    for tag in fallback_tags:
-        if tag.lower() not in [x.lower() for x in tags]:
-            tags.append(tag)
-
-    final_tags = []
-    total_chars = 0
-
-    for tag in tags:
-        extra = len(tag) + (1 if final_tags else 0)
-        if total_chars + extra <= 500:
-            final_tags.append(tag)
-            total_chars += extra
-
-    story["tags"] = final_tags
-
-    raw_hashtags = story.get("hashtags", [])
-    if not isinstance(raw_hashtags, list):
-        raw_hashtags = []
-
-    hashtags = []
-
-    for item in raw_hashtags:
-        if isinstance(item, str):
-            value = "".join(
-                ch for ch in item.replace("#", "")
-                if ch.isalnum() or ch == "_"
-            )
-            if value and value.lower() not in [x.lower() for x in hashtags]:
-                hashtags.append(value[:30])
-
-    for item in ["MysteryVerse", "Mystery", "Shorts"]:
-        if item.lower() not in [x.lower() for x in hashtags]:
-            hashtags.append(item)
-
-    story["hashtags"] = hashtags[:5]
-
-    return story
+def get_duration(path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            path
+        ],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    return float(result.stdout.strip())
 
 
 def generate_story():
-    key = os.environ["GEMINI_API_KEY"]
-
     prompt = """
-Create one original fictional mystery story
-for an English YouTube Short.
+Create an original fictional mystery story for an English YouTube Short.
 
-Return valid JSON only with these keys:
+Return valid JSON with these fields:
 title, narration, description, tags, hashtags.
 
 Rules:
-- Title: compelling English title under 80 characters.
-- Narration: 70-90 spoken English words with a strong hook.
-- Description: 2-4 natural English sentences about the story.
-- Never claim the fictional story is true.
-- Tags: array of 8-15 relevant YouTube search tags.
-- Hashtags: array of 3-5 relevant hashtags.
-- Do not include # symbols inside tags or hashtags.
-- Avoid unrelated trending keywords.
-- Keep the story family-friendly.
-- Do not use real people's names.
+- Title under 80 characters.
+- Narration 70-90 spoken English words.
+- Start with a powerful hook.
+- Keep it suspenseful and family-friendly.
+- Description 2-4 sentences.
+- Tags must be a list of relevant keywords.
+- Hashtags must be a list without the # symbol.
+- Never claim the fictional story is real.
 """
 
     url = (
@@ -108,203 +67,413 @@ Rules:
         "models/gemini-3.5-flash-lite:generateContent"
     )
 
+    key = os.environ["GEMINI_API_KEY"]
+
     for attempt in range(4):
-        try:
-            print(f"Generating story (attempt {attempt + 1}/4)...")
-
-            response = requests.post(
-                url,
-                params={"key": key},
-                json={
-                    "contents": [
-                        {"parts": [{"text": prompt}]}
-                    ],
-                    "generationConfig": {
-                        "responseMimeType": "application/json"
-                    }
-                },
-                timeout=(20, 300)
-            )
-
-            if response.status_code in (429, 500, 502, 503, 504):
-                if attempt < 3:
-                    wait = 15 * (attempt + 1)
-                    print(f"Gemini busy. Retrying in {wait}s...")
-                    time.sleep(wait)
-                    continue
-
-            response.raise_for_status()
-
-            result = response.json()
-            candidates = result.get("candidates", [])
-
-            if not candidates:
-                raise RuntimeError("Gemini returned no story.")
-
-            story_text = candidates[0]["content"]["parts"][0]["text"]
-            story = json.loads(story_text)
-
-            for field in ("title", "narration", "description"):
-                if not isinstance(story.get(field), str) or not story[field].strip():
-                    raise ValueError(f"Missing field: {field}")
-
-            story = clean_metadata(story)
-
-            print("Story generated successfully.")
-            print("SEO tags:", len(story["tags"]))
-            print("Hashtags:", len(story["hashtags"]))
-
-            return story
-
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError
-        ):
-            if attempt == 3:
-                raise
-
-            wait = 15 * (attempt + 1)
-            print(f"Connection problem. Retrying in {wait}s...")
-            time.sleep(wait)
-
-    raise RuntimeError("Gemini failed after 4 attempts.")
-
-
-def make_poster(title, narration):
-    width, height = 1080, 1920
-    img = Image.new("RGB", (width, height))
-    pixels = img.load()
-
-    for y in range(height):
-        shade = int(12 + 30 * y / height)
-        for x in range(width):
-            pixels[x, y] = (shade, shade, shade + 28)
-
-    draw = ImageDraw.Draw(img)
-    random.seed(12)
-
-    for _ in range(100):
-        x = random.randint(0, width)
-        y = random.randint(0, height)
-        draw.ellipse(
-            (x, y, x + 4, y + 4),
-            fill=(150, 170, 210)
+        response = requests.post(
+            url,
+            params={"key": key},
+            json={
+                "contents": [
+                    {"parts": [{"text": prompt}]}
+                ],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            },
+            timeout=180
         )
 
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    regular_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        if response.status_code in (429, 500, 502, 503, 504):
+            time.sleep(15 * (attempt + 1))
+            continue
+
+        response.raise_for_status()
+
+        candidates = response.json().get("candidates", [])
+
+        if not candidates:
+            raise RuntimeError("Gemini returned no story.")
+
+        story = json.loads(
+            candidates[0]["content"]["parts"][0]["text"]
+        )
+
+        for field in ("title", "narration", "description"):
+            if not story.get(field):
+                raise ValueError("Missing story field: " + field)
+
+        return story
+
+    raise RuntimeError("Gemini request failed after retries.")
+
+
+async def create_voice(narration):
+    voice = edge_tts.Communicate(
+        narration,
+        "en-US-AndrewNeural"
+    )
+    await voice.save(AUDIO)
+
+
+def create_poster(title, narration):
+    image = Image.new(
+        "RGB",
+        (1080, 1920),
+        (12, 18, 42)
+    )
+
+    draw = ImageDraw.Draw(image)
 
     try:
-        big = ImageFont.truetype(font_path, 76)
-        medium = ImageFont.truetype(regular_path, 39)
-        small = ImageFont.truetype(font_path, 34)
+        title_font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            70
+        )
+        body_font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            38
+        )
     except OSError:
-        big = medium = small = ImageFont.load_default()
+        title_font = body_font = ImageFont.load_default()
 
     draw.text(
-        (65, 100),
+        (65, 120),
         "MYSTERYVERSE",
-        font=small,
         fill="white"
     )
 
     draw.text(
-        (65, 250),
-        "TONIGHT'S",
-        font=small,
+        (65, 300),
+        title[:70],
+        font=title_font,
         fill=(120, 190, 255)
     )
 
-    lines = []
+    words = narration[:350].split()
     line = ""
+    y = 850
 
-    for word in title.split():
+    for word in words:
         test = (line + " " + word).strip()
 
-        if draw.textbbox((0, 0), test, font=big)[2] > 930:
-            if line:
-                lines.append(line)
+        if draw.textbbox((0, 0), test, font=body_font)[2] > 900:
+            draw.text(
+                (75, y),
+                line,
+                font=body_font,
+                fill="white"
+            )
+            y += 60
             line = word
         else:
             line = test
 
     if line:
-        lines.append(line)
-
-    y = 350
-
-    for line in lines[:4]:
         draw.text(
-            (65, y),
+            (75, y),
             line,
-            font=big,
+            font=body_font,
             fill="white"
         )
-        y += 105
 
-    draw.rounded_rectangle(
-        (55, 900, 1025, 1550),
-        radius=35,
-        fill=(22, 30, 55)
+    image.save(POSTER)
+
+
+def get_search_terms(story):
+    text = story["title"] + " " + story["narration"]
+
+    words = re.findall(
+        r"[a-z]{4,}",
+        text.lower()
     )
 
-    lines = []
-    line = ""
+    ignored = {
+        "there", "their", "where", "which",
+        "would", "could", "about", "after",
+        "before", "while", "never", "every",
+        "because", "something", "someone",
+        "inside", "heard", "looked", "turned",
+        "found", "story"
+    }
 
-    for word in narration[:260].split():
-        test = (line + " " + word).strip()
+    terms = []
 
-        if draw.textbbox((0, 0), test, font=medium)[2] > 870:
-            if line:
-                lines.append(line)
-            line = word
-        else:
-            line = test
+    for word in words:
+        if word not in ignored and word not in terms:
+            terms.append(word)
 
-    if line:
-        lines.append(line)
+        if len(terms) >= 5:
+            break
 
-    y = 970
+    return terms or ["dark forest", "abandoned house"]
 
-    for line in lines[:8]:
-        draw.text(
-            (100, y),
-            line,
-            font=medium,
-            fill="white"
+
+def allowed_license(metadata):
+    name = metadata.get(
+        "LicenseShortName", {}
+    ).get("value", "").lower()
+
+    url = metadata.get(
+        "LicenseUrl", {}
+    ).get("value", "").lower()
+
+    text = name + " " + url
+
+    allowed = (
+        "cc0" in text
+        or "public domain" in text
+        or "cc by" in text
+        or "cc-by" in text
+    )
+
+    forbidden = any(term in text for term in [
+        "by-nc",
+        "by-nd",
+        "noncommercial",
+        "no derivatives"
+    ])
+
+    return allowed and not forbidden
+
+
+def search_commons(query):
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrnamespace": 6,
+        "gsrlimit": 10,
+        "gsrsearch": query,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|extmetadata",
+        "iiextmetadatafilter": (
+            "LicenseShortName|LicenseUrl|Artist|Attribution"
         )
-        y += 65
+    }
 
-    draw.text(
-        (65, 1700),
-        "LISTEN CLOSELY - THE CLUE IS HIDDEN",
-        font=small,
-        fill=(120, 190, 255)
+    response = requests.get(
+        COMMONS_API,
+        params=params,
+        headers=HEADERS,
+        timeout=45
     )
 
-    img.save(POSTER)
-    print("Poster created.")
+    response.raise_for_status()
+
+    pages = response.json().get(
+        "query", {}
+    ).get("pages", {})
+
+    results = []
+
+    for page in pages.values():
+        info = (page.get("imageinfo") or [{}])[0]
+        metadata = info.get("extmetadata", {})
+
+        if not info.get("mime", "").lower().startswith("video/"):
+            continue
+
+        if not allowed_license(metadata):
+            continue
+
+        url = info.get("url", "")
+
+        if not url.startswith("https://"):
+            continue
+
+        results.append({
+            "url": url,
+            "title": page.get("title", "Video"),
+            "license": metadata.get(
+                "LicenseShortName", {}
+            ).get("value", "Licence unknown"),
+            "artist": metadata.get(
+                "Artist", {}
+            ).get("value", "Unknown creator")
+        })
+
+    return results
 
 
-async def make_voice(text):
-    voice = edge_tts.Communicate(
-        text,
-        "en-US-AndrewNeural"
+def download_clip(item, number):
+    os.makedirs(CLIP_DIR, exist_ok=True)
+
+    path = os.path.join(
+        CLIP_DIR,
+        f"source_{number}.video"
     )
 
-    await voice.save(AUDIO)
-    print("English narration created.")
+    response = requests.get(
+        item["url"],
+        headers=HEADERS,
+        stream=True,
+        timeout=(30, 120)
+    )
+
+    response.raise_for_status()
+
+    total = 0
+
+    with open(path, "wb") as file:
+        for chunk in response.iter_content(262144):
+            if not chunk:
+                continue
+
+            total += len(chunk)
+
+            if total > 60 * 1024 * 1024:
+                raise ValueError("Video exceeds size limit.")
+
+            file.write(chunk)
+
+    return path
 
 
-def make_video():
-    command = [
+def create_moving_video(story):
+    if os.path.exists(CLIP_DIR):
+        for filename in os.listdir(CLIP_DIR):
+            path = os.path.join(CLIP_DIR, filename)
+
+            if os.path.isfile(path):
+                os.remove(path)
+
+    os.makedirs(CLIP_DIR, exist_ok=True)
+
+    found = []
+    seen = set()
+
+    for term in get_search_terms(story):
+        try:
+            for item in search_commons(term):
+                if item["url"] not in seen:
+                    seen.add(item["url"])
+                    found.append(item)
+        except Exception as error:
+            print("Commons search error:", error)
+
+        if len(found) >= 4:
+            break
+
+    segments = []
+    credits = []
+
+    for item in found[:4]:
+        try:
+            number = len(segments) + 1
+
+            source = download_clip(item, number)
+
+            segment = os.path.join(
+                CLIP_DIR,
+                f"segment_{number}.mp4"
+            )
+
+            run([
+                "ffmpeg", "-y",
+                "-i", source,
+                "-t", "8",
+                "-an",
+                "-vf",
+                "scale=1080:1920:"
+                "force_original_aspect_ratio=increase,"
+                "crop=1080:1920,fps=30,setsar=1,"
+                "format=yuv420p",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "24",
+                segment
+            ])
+
+            segments.append(segment)
+
+            credits.append(
+                f'{item["title"]} | '
+                f'{item["license"]} | '
+                f'{item["artist"]} | '
+                f'{item["url"]}'
+            )
+
+        except Exception as error:
+            print("Skipping clip:", error)
+
+    if not segments:
+        print("No suitable moving clips found.")
+        return False, []
+
+    target_duration = get_duration(AUDIO)
+
+    concat_file = os.path.join(
+        CLIP_DIR,
+        "concat.txt"
+    )
+
+    with open(concat_file, "w", encoding="utf-8") as file:
+        total_duration = 0
+        index = 0
+
+        while total_duration < target_duration + 1:
+            path = os.path.abspath(
+                segments[index % len(segments)]
+            )
+
+            file.write(
+                "file '" + path.replace("'", "'\\''") + "'\n"
+            )
+
+            total_duration += 8
+            index += 1
+
+    visuals = os.path.join(
+        CLIP_DIR,
+        "visuals.mp4"
+    )
+
+    run([
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_file,
+        "-c", "copy",
+        visuals
+    ])
+
+    run([
+        "ffmpeg", "-y",
+        "-i", visuals,
+        "-i", AUDIO,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-vf",
+        "scale=1080:1920:"
+        "force_original_aspect_ratio=increase,"
+        "crop=1080:1920,fps=30,format=yuv420p",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+        VIDEO
+    ])
+
+    print("Moving video created.")
+    return True, credits
+
+
+def create_fallback_video():
+    run([
         "ffmpeg", "-y",
         "-loop", "1",
         "-framerate", "30",
         "-i", POSTER,
         "-i", AUDIO,
         "-vf",
-        "scale=1080:1920,zoompan=z='min(zoom+0.0004,1.08)':d=1:s=1080x1920:fps=30,format=yuv420p",
+        "scale=1080:1920,"
+        "zoompan=z='min(zoom+0.0004,1.08)':"
+        "d=1:s=1080x1920:fps=30,"
+        "format=yuv420p",
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-c:a", "aac",
@@ -312,20 +481,19 @@ def make_video():
         "-shortest",
         "-movflags", "+faststart",
         VIDEO
-    ]
-
-    subprocess.run(command, check=True)
-    print("Video created successfully.")
+    ])
 
 
-def upload_video(story):
+def upload_to_youtube(story, credits):
     credentials = Credentials(
         token=None,
         refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
         token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["YOUTUBE_CLIENT_ID"],
         client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
-        scopes=["https://www.googleapis.com/auth/youtube.upload"]
+        scopes=[
+            "https://www.googleapis.com/auth/youtube.upload"
+        ]
     )
 
     credentials.refresh(Request())
@@ -338,23 +506,29 @@ def upload_video(story):
     )
 
     hashtags = " ".join(
-        "#" + h for h in story.get(
+        "#" + tag
+        for tag in story.get(
             "hashtags",
             ["MysteryVerse", "Mystery", "Shorts"]
         )
     )
 
     description = (
-        story["description"].strip()
-        + "\n\nFollow MysteryVerse for more original mystery stories."
-        + "\n\n"
-        + hashtags
-    )[:5000]
+        story["description"]
+        + "\n\nFollow MysteryVerse for more mystery stories."
+        + "\n\n" + hashtags
+    )
+
+    if credits:
+        description += (
+            "\n\nFootage credits:\n"
+            + "\n".join(credits)
+        )
 
     body = {
         "snippet": {
             "title": story["title"][:100],
-            "description": description,
+            "description": description[:5000],
             "tags": story.get("tags", [])[:15],
             "categoryId": "24",
             "defaultLanguage": "en",
@@ -378,18 +552,31 @@ def upload_video(story):
         media_body=media
     ).execute()
 
-    print("Private video uploaded successfully!")
-    print("YouTube video ID:", result["id"])
+    print(
+        "Private YouTube upload successful:",
+        result["id"]
+    )
 
 
 if __name__ == "__main__":
     print("Starting MysteryVerse automation...")
 
     story = generate_story()
-    make_poster(story["title"], story["narration"])
-    asyncio.run(make_voice(story["narration"]))
-    make_video()
-    upload_video(story)
+
+    asyncio.run(
+        create_voice(story["narration"])
+    )
+
+    moving, credits = create_moving_video(story)
+
+    if not moving:
+        create_poster(
+            story["title"],
+            story["narration"]
+        )
+        create_fallback_video()
+
+    upload_to_youtube(story, credits)
 
     print("MysteryVerse automation completed!")
     
