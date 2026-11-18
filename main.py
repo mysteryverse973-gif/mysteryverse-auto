@@ -8,7 +8,6 @@ import subprocess
 import requests
 import edge_tts
 
-from PIL import Image, ImageDraw, ImageFont
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -16,20 +15,19 @@ from googleapiclient.http import MediaFileUpload
 
 VIDEO = "mysteryverse_short.mp4"
 AUDIO = "narration.mp3"
-POSTER = "poster.png"
-CLIP_DIR = "commons_clips"
-
+CLIP_DIR = "clips"
 COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+
 HEADERS = {
     "User-Agent": "MysteryVerseBot/1.0 (video creator)"
 }
 
 
-def run(command):
-    subprocess.run(command, check=True)
+def run(cmd):
+    subprocess.run(cmd, check=True)
 
 
-def get_duration(path):
+def duration(path):
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -37,9 +35,7 @@ def get_duration(path):
             "-of", "default=noprint_wrappers=1:nokey=1",
             path
         ],
-        capture_output=True,
-        text=True,
-        check=True
+        capture_output=True, text=True, check=True
     )
     return float(result.stdout.strip())
 
@@ -47,21 +43,18 @@ def get_duration(path):
 def generate_story():
     prompt = """
 Create an original fictional mystery story for an English YouTube Short.
-
-Return valid JSON with these fields:
+Return valid JSON with:
 title, narration, description, tags, hashtags.
 
 Rules:
+- Narration: 70-90 spoken English words.
+- Strong suspense hook in the first sentence.
+- Family-friendly fictional mystery.
 - Title under 80 characters.
-- Narration 70-90 spoken English words.
-- Start with a powerful hook.
-- Keep it suspenseful and family-friendly.
 - Description 2-4 sentences.
-- Tags must be a list of relevant keywords.
-- Hashtags must be a list without the # symbol.
-- Never claim the fictional story is real.
+- tags and hashtags must be lists.
+- Never claim the story is real.
 """
-
     url = (
         "https://generativelanguage.googleapis.com/v1beta/"
         "models/gemini-3.5-flash-lite:generateContent"
@@ -74,9 +67,7 @@ Rules:
             url,
             params={"key": key},
             json={
-                "contents": [
-                    {"parts": [{"text": prompt}]}
-                ],
+                "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "responseMimeType": "application/json"
                 }
@@ -89,11 +80,10 @@ Rules:
             continue
 
         response.raise_for_status()
-
         candidates = response.json().get("candidates", [])
 
         if not candidates:
-            raise RuntimeError("Gemini returned no story.")
+            raise RuntimeError("No story returned by Gemini.")
 
         story = json.loads(
             candidates[0]["content"]["parts"][0]["text"]
@@ -105,108 +95,38 @@ Rules:
 
         return story
 
-    raise RuntimeError("Gemini request failed after retries.")
+    raise RuntimeError("Story generation failed.")
 
 
-async def create_voice(narration):
+async def create_voice(text):
     voice = edge_tts.Communicate(
-        narration,
-        "en-US-AndrewNeural"
+        text, "en-US-AndrewNeural"
     )
     await voice.save(AUDIO)
 
 
-def create_poster(title, narration):
-    image = Image.new(
-        "RGB",
-        (1080, 1920),
-        (12, 18, 42)
-    )
-
-    draw = ImageDraw.Draw(image)
-
-    try:
-        title_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            70
-        )
-        body_font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            38
-        )
-    except OSError:
-        title_font = body_font = ImageFont.load_default()
-
-    draw.text(
-        (65, 120),
-        "MYSTERYVERSE",
-        fill="white"
-    )
-
-    draw.text(
-        (65, 300),
-        title[:70],
-        font=title_font,
-        fill=(120, 190, 255)
-    )
-
-    words = narration[:350].split()
-    line = ""
-    y = 850
-
-    for word in words:
-        test = (line + " " + word).strip()
-
-        if draw.textbbox((0, 0), test, font=body_font)[2] > 900:
-            draw.text(
-                (75, y),
-                line,
-                font=body_font,
-                fill="white"
-            )
-            y += 60
-            line = word
-        else:
-            line = test
-
-    if line:
-        draw.text(
-            (75, y),
-            line,
-            font=body_font,
-            fill="white"
-        )
-
-    image.save(POSTER)
-
-
-def get_search_terms(story):
-    text = story["title"] + " " + story["narration"]
-
+def search_terms(story):
     words = re.findall(
         r"[a-z]{4,}",
-        text.lower()
+        (story["title"] + " " + story["narration"]).lower()
     )
 
     ignored = {
-        "there", "their", "where", "which",
-        "would", "could", "about", "after",
-        "before", "while", "never", "every",
-        "because", "something", "someone",
-        "inside", "heard", "looked", "turned",
-        "found", "story"
+        "there", "their", "where", "which", "would",
+        "could", "about", "after", "before", "while",
+        "never", "every", "because", "someone",
+        "something", "inside", "heard", "looked",
+        "turned", "found", "story"
     }
 
-    terms = []
-
+    result = []
     for word in words:
-        if word not in ignored and word not in terms:
-            terms.append(word)
-
-        if len(terms) >= 5:
+        if word not in ignored and word not in result:
+            result.append(word)
+        if len(result) == 6:
             break
 
-    return terms or ["dark forest", "abandoned house"]
+    return result or ["dark forest", "abandoned house"]
 
 
 def allowed_license(metadata):
@@ -227,10 +147,8 @@ def allowed_license(metadata):
         or "cc-by" in text
     )
 
-    forbidden = any(term in text for term in [
-        "by-nc",
-        "by-nd",
-        "noncommercial",
+    forbidden = any(x in text for x in [
+        "by-nc", "by-nd", "noncommercial",
         "no derivatives"
     ])
 
@@ -243,13 +161,10 @@ def search_commons(query):
         "format": "json",
         "generator": "search",
         "gsrnamespace": 6,
-        "gsrlimit": 10,
+        "gsrlimit": 20,
         "gsrsearch": query,
         "prop": "imageinfo",
-        "iiprop": "url|mime|extmetadata",
-        "iiextmetadatafilter": (
-            "LicenseShortName|LicenseUrl|Artist|Attribution"
-        )
+        "iiprop": "url|mime|extmetadata"
     }
 
     response = requests.get(
@@ -258,14 +173,13 @@ def search_commons(query):
         headers=HEADERS,
         timeout=45
     )
-
     response.raise_for_status()
 
     pages = response.json().get(
         "query", {}
     ).get("pages", {})
 
-    results = []
+    found = []
 
     for page in pages.values():
         info = (page.get("imageinfo") or [{}])[0]
@@ -278,31 +192,26 @@ def search_commons(query):
             continue
 
         url = info.get("url", "")
-
         if not url.startswith("https://"):
             continue
 
-        results.append({
+        found.append({
             "url": url,
             "title": page.get("title", "Video"),
             "license": metadata.get(
                 "LicenseShortName", {}
-            ).get("value", "Licence unknown"),
+            ).get("value", "Unknown"),
             "artist": metadata.get(
                 "Artist", {}
-            ).get("value", "Unknown creator")
+            ).get("value", "Unknown")
         })
 
-    return results
+    return found
 
 
 def download_clip(item, number):
     os.makedirs(CLIP_DIR, exist_ok=True)
-
-    path = os.path.join(
-        CLIP_DIR,
-        f"source_{number}.video"
-    )
+    path = os.path.join(CLIP_DIR, f"source_{number}.video")
 
     response = requests.get(
         item["url"],
@@ -310,20 +219,17 @@ def download_clip(item, number):
         stream=True,
         timeout=(30, 120)
     )
-
     response.raise_for_status()
 
     total = 0
-
     with open(path, "wb") as file:
         for chunk in response.iter_content(262144):
             if not chunk:
                 continue
 
             total += len(chunk)
-
             if total > 60 * 1024 * 1024:
-                raise ValueError("Video exceeds size limit.")
+                raise ValueError("Clip too large.")
 
             file.write(chunk)
 
@@ -332,9 +238,8 @@ def download_clip(item, number):
 
 def create_moving_video(story):
     if os.path.exists(CLIP_DIR):
-        for filename in os.listdir(CLIP_DIR):
-            path = os.path.join(CLIP_DIR, filename)
-
+        for name in os.listdir(CLIP_DIR):
+            path = os.path.join(CLIP_DIR, name)
             if os.path.isfile(path):
                 os.remove(path)
 
@@ -343,30 +248,25 @@ def create_moving_video(story):
     found = []
     seen = set()
 
-    for term in get_search_terms(story):
+    for term in search_terms(story):
         try:
             for item in search_commons(term):
                 if item["url"] not in seen:
                     seen.add(item["url"])
                     found.append(item)
         except Exception as error:
-            print("Commons search error:", error)
-
-        if len(found) >= 4:
-            break
+            print("Search error:", error)
 
     segments = []
     credits = []
 
-    for item in found[:4]:
+    for item in found:
         try:
             number = len(segments) + 1
-
             source = download_clip(item, number)
 
             segment = os.path.join(
-                CLIP_DIR,
-                f"segment_{number}.mp4"
+                CLIP_DIR, f"scene_{number}.mp4"
             )
 
             run([
@@ -385,49 +285,47 @@ def create_moving_video(story):
                 segment
             ])
 
-            segments.append(segment)
+            if duration(segment) >= 6:
+                segments.append(segment)
+                credits.append(
+                    f'{item["title"]} | {item["license"]} | '
+                    f'{item["artist"]} | {item["url"]}'
+                )
 
-            credits.append(
-                f'{item["title"]} | '
-                f'{item["license"]} | '
-                f'{item["artist"]} | '
-                f'{item["url"]}'
-            )
+            if len(segments) >= 8:
+                break
 
         except Exception as error:
             print("Skipping clip:", error)
 
-    if not segments:
-        print("No suitable moving clips found.")
-        return False, []
+    # Never upload a poster or a video with too few scenes.
+    if len(segments) < 4:
+        raise RuntimeError(
+            "Upload cancelled: fewer than 4 distinct moving scenes."
+        )
 
-    target_duration = get_duration(AUDIO)
-
-    concat_file = os.path.join(
-        CLIP_DIR,
-        "concat.txt"
+    audio_duration = duration(AUDIO)
+    total_visual_duration = sum(
+        duration(path) for path in segments
     )
+
+    # Never repeat clips to fill the narration.
+    if total_visual_duration < audio_duration:
+        raise RuntimeError(
+            "Upload cancelled: moving scenes are too short "
+            "for the narration."
+        )
+
+    concat_file = os.path.join(CLIP_DIR, "concat.txt")
 
     with open(concat_file, "w", encoding="utf-8") as file:
-        total_duration = 0
-        index = 0
-
-        while total_duration < target_duration + 1:
-            path = os.path.abspath(
-                segments[index % len(segments)]
-            )
-
+        for path in segments:
+            absolute = os.path.abspath(path)
             file.write(
-                "file '" + path.replace("'", "'\\''") + "'\n"
+                "file '" + absolute.replace("'", "'\\''") + "'\n"
             )
 
-            total_duration += 8
-            index += 1
-
-    visuals = os.path.join(
-        CLIP_DIR,
-        "visuals.mp4"
-    )
+    visuals = os.path.join(CLIP_DIR, "visuals.mp4")
 
     run([
         "ffmpeg", "-y",
@@ -458,30 +356,11 @@ def create_moving_video(story):
         VIDEO
     ])
 
-    print("Moving video created.")
-    return True, credits
+    if duration(VIDEO) < audio_duration * 0.95:
+        raise RuntimeError("Final video failed duration check.")
 
-
-def create_fallback_video():
-    run([
-        "ffmpeg", "-y",
-        "-loop", "1",
-        "-framerate", "30",
-        "-i", POSTER,
-        "-i", AUDIO,
-        "-vf",
-        "scale=1080:1920,"
-        "zoompan=z='min(zoom+0.0004,1.08)':"
-        "d=1:s=1080x1920:fps=30,"
-        "format=yuv420p",
-        "-c:v", "libx264",
-        "-tune", "stillimage",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-shortest",
-        "-movflags", "+faststart",
-        VIDEO
-    ])
+    print("Moving-scene video created.")
+    return credits
 
 
 def upload_to_youtube(story, credits):
@@ -499,17 +378,14 @@ def upload_to_youtube(story, credits):
     credentials.refresh(Request())
 
     youtube = build(
-        "youtube",
-        "v3",
+        "youtube", "v3",
         credentials=credentials,
         cache_discovery=False
     )
 
     hashtags = " ".join(
-        "#" + tag
-        for tag in story.get(
-            "hashtags",
-            ["MysteryVerse", "Mystery", "Shorts"]
+        "#" + tag for tag in story.get(
+            "hashtags", ["MysteryVerse", "Mystery", "Shorts"]
         )
     )
 
@@ -517,13 +393,9 @@ def upload_to_youtube(story, credits):
         story["description"]
         + "\n\nFollow MysteryVerse for more mystery stories."
         + "\n\n" + hashtags
+        + "\n\nFootage credits:\n"
+        + "\n".join(credits)
     )
-
-    if credits:
-        description += (
-            "\n\nFootage credits:\n"
-            + "\n".join(credits)
-        )
 
     body = {
         "snippet": {
@@ -552,31 +424,19 @@ def upload_to_youtube(story, credits):
         media_body=media
     ).execute()
 
-    print(
-        "Private YouTube upload successful:",
-        result["id"]
-    )
+    print("Private upload successful:", result["id"])
 
 
 if __name__ == "__main__":
-    print("Starting MysteryVerse automation...")
+    print("Starting MysteryVerse...")
 
     story = generate_story()
+    asyncio.run(create_voice(story["narration"]))
 
-    asyncio.run(
-        create_voice(story["narration"])
-    )
+    credits = create_moving_video(story)
 
-    moving, credits = create_moving_video(story)
-
-    if not moving:
-        create_poster(
-            story["title"],
-            story["narration"]
-        )
-        create_fallback_video()
-
+    # Upload happens only after all moving-scene checks pass.
     upload_to_youtube(story, credits)
 
-    print("MysteryVerse automation completed!")
+    print("MysteryVerse completed.")
     
